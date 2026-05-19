@@ -3,15 +3,19 @@
  *
  * @example
  * ```ts
- * import { LibreSQL } from 'libresql';
+ * import { LibreSQL, KeyStore, deriveKey } from 'libresql';
+ *
+ * // Derive key once at login; store securely in-session
+ * const key = await deriveKey(password, salt);
+ * KeyStore.set('main', key);
  *
  * // Load an encrypted database from a remote URL
  * const db = await LibreSQL.fromURL('https://cdn.example.com/store.lsql', {
- *   password: 'correct horse battery staple',
+ *   key: KeyStore.get('main')!,
  * });
  *
- * const [result] = db.exec('SELECT * FROM files');
- * console.log(result.columns, result.values);
+ * const [result] = db.exec("SELECT * FROM files WHERE name LIKE '%.pdf'");
+ * console.log(result.values);
  *
  * db.close();
  * ```
@@ -22,18 +26,21 @@
 // Main class
 export { LibreSQL } from './database.js';
 
-// Crypto primitives (for advanced use-cases)
-export { decryptData, deriveKey, encryptData, generateKey, importRawKey } from './crypto.js';
-
 // Secure session key storage
 export { KeyStore } from './keystore.js';
+
+// Crypto primitives (for advanced use-cases)
+export { DEFAULT_ITERATIONS, decryptData, deriveKey, encryptData, generateKey, importRawKey } from './crypto.js';
+export type { DecryptResult } from './crypto.js';
 
 // Types
 export type {
   BindParams,
   CreateOptions,
+  DatabaseEncryptOptions,
   EncryptOptions,
   OpenOptions,
   QueryResult,
   SqlValue,
+  WasmOptions,
 } from './types.js';

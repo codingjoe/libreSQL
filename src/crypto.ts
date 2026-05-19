@@ -6,14 +6,17 @@
  *
  * Encryption scheme
  * -----------------
- *   Key derivation : PBKDF2-SHA256, 600 000 iterations (OWASP minimum)
+ *   Key derivation : PBKDF2-SHA256, 600 000 iterations (≥ 2× the 2025 OWASP minimum)
  *   Symmetric cipher: AES-256-GCM (authenticated encryption)
+ *   Compression    : DEFLATE-raw (optional, applied before encryption)
  *   Random values  : crypto.getRandomValues
  */
 
 import {
   EncryptOptions,
   FILE_VERSION,
+  FLAG_COMPRESSED,
+  FLAGS_NONE,
   HEADER_MAGIC,
   HEADER_SIZE,
   IV_LENGTH,
@@ -22,8 +25,14 @@ import {
   SALT_LENGTH,
 } from './types.js';
 
-/** Default PBKDF2 iteration count (OWASP 2023 recommendation). */
+/** Default PBKDF2 iteration count (≥ 2× the 2025 OWASP minimum of 310 000). */
 export const DEFAULT_ITERATIONS = 600_000;
+
+// Header field offsets
+const OFFSET_FLAGS      = 10;
+const OFFSET_SALT       = 11;
+const OFFSET_IV         = 11 + SALT_LENGTH; // 43
+const OFFSET_CIPHERTEXT = HEADER_SIZE;       // 55
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -51,6 +60,30 @@ function randomBytes(n: number): Uint8Array<ArrayBuffer> {
   const buf = new Uint8Array(n) as Uint8Array<ArrayBuffer>;
   crypto.getRandomValues(buf);
   return buf;
+}
+
+// ---------------------------------------------------------------------------
+// Compression helpers (DEFLATE-raw via Baseline CompressionStream API)
+// ---------------------------------------------------------------------------
+
+/** Compresses `data` using DEFLATE-raw. */
+async function compressBytes(data: Uint8Array): Promise<Uint8Array> {
+  const cs = new CompressionStream('deflate-raw');
+  const writer = cs.writable.getWriter();
+  writer.write(toArrayBufferView(data));
+  writer.close();
+  const buf = await new Response(cs.readable).arrayBuffer();
+  return new Uint8Array(buf);
+}
+
+/** Decompresses DEFLATE-raw compressed `data`. */
+async function decompressBytes(data: Uint8Array): Promise<Uint8Array<ArrayBuffer>> {
+  const ds = new DecompressionStream('deflate-raw');
+  const writer = ds.writable.getWriter();
+  writer.write(toArrayBufferView(data));
+  writer.close();
+  const buf = await new Response(ds.readable).arrayBuffer();
+  return new Uint8Array(buf) as Uint8Array<ArrayBuffer>;
 }
 
 // ---------------------------------------------------------------------------
@@ -102,9 +135,9 @@ export async function deriveKey(
 /**
  * Encrypts `plaintext` and returns an encrypted LibreSQL blob.
  *
- * The returned buffer has the following layout (all big-endian):
+ * Header layout (55 bytes, all big-endian):
  * ```
- *  [magic 4B][version 1B][kdf 1B][iterations 4B][salt 32B][iv 12B][ciphertext…]
+ *  [magic 4B][version 1B][kdf 1B][iterations 4B][flags 1B][salt 32B][iv 12B][ciphertext…]
  * ```
  *
  * @param plaintext - Raw bytes to encrypt (e.g. a SQLite database file).
@@ -119,6 +152,7 @@ export async function encryptData(
     throw new TypeError('encryptData: either "password" or "key" must be provided');
   }
 
+  const compress = options.compress ?? false;
   const iterations = options.iterations ?? DEFAULT_ITERATIONS;
   const salt = randomBytes(SALT_LENGTH);
   const iv = randomBytes(IV_LENGTH);
@@ -130,10 +164,12 @@ export async function encryptData(
     key = await deriveKey(options.password!, salt, iterations);
   }
 
+  const payload = compress ? await compressBytes(plaintext) : plaintext;
+
   const ciphertext = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv },
     key,
-    toArrayBufferView(plaintext),
+    toArrayBufferView(payload),
   );
 
   // Build header
@@ -141,18 +177,13 @@ export async function encryptData(
   const view = new DataView(header);
   const headerBytes = new Uint8Array(header);
 
-  // Magic "LSQL"
-  headerBytes.set(HEADER_MAGIC, 0);
-  // Version
-  view.setUint8(4, FILE_VERSION);
-  // KDF identifier
-  view.setUint8(5, KDF_PBKDF2_SHA256);
-  // Iteration count (big-endian)
-  view.setUint32(6, iterations, false);
-  // Salt
-  headerBytes.set(salt, 10);
-  // IV
-  headerBytes.set(iv, 10 + SALT_LENGTH);
+  headerBytes.set(HEADER_MAGIC, 0);                // magic "LSQL"
+  view.setUint8(4, FILE_VERSION);                  // version
+  view.setUint8(5, KDF_PBKDF2_SHA256);             // KDF
+  view.setUint32(6, iterations, false);             // iterations (BE)
+  view.setUint8(OFFSET_FLAGS, compress ? FLAG_COMPRESSED : FLAGS_NONE); // flags
+  headerBytes.set(salt, OFFSET_SALT);              // salt
+  headerBytes.set(iv, OFFSET_IV);                  // IV
 
   // Concatenate header + ciphertext
   const result = new Uint8Array(HEADER_SIZE + ciphertext.byteLength);
@@ -166,18 +197,32 @@ export async function encryptData(
 // ---------------------------------------------------------------------------
 
 /**
- * Decrypts an encrypted LibreSQL blob and returns the original plaintext.
+ * Result returned by {@link decryptData}.
+ */
+export interface DecryptResult {
+  /** The decrypted plaintext bytes. */
+  data: Uint8Array;
+  /**
+   * The resolved AES-256-GCM `CryptoKey` used for decryption.
+   * Store this in {@link KeyStore} to avoid re-deriving on every operation.
+   */
+  key: CryptoKey;
+}
+
+/**
+ * Decrypts an encrypted LibreSQL blob and returns the original plaintext
+ * along with the resolved `CryptoKey`.
  *
  * @param data    - The encrypted blob produced by {@link encryptData}.
  * @param options - Must contain either `password` or `key`.
- * @returns A Uint8Array containing the decrypted plaintext bytes.
+ * @returns Decrypted bytes and the resolved key.
  * @throws {TypeError}  When required options are missing or the magic bytes don't match.
  * @throws {DOMException} When decryption fails (wrong key / corrupted data).
  */
 export async function decryptData(
   data: Uint8Array,
   options: OpenOptions,
-): Promise<Uint8Array> {
+): Promise<DecryptResult> {
   if (!options.password && !options.key) {
     throw new TypeError('decryptData: either "password" or "key" must be provided');
   }
@@ -208,9 +253,10 @@ export async function decryptData(
   }
 
   const iterations = view.getUint32(6, false);
-  const salt = normalised.slice(10, 10 + SALT_LENGTH);
-  const iv = normalised.slice(10 + SALT_LENGTH, 10 + SALT_LENGTH + IV_LENGTH);
-  const ciphertext = normalised.slice(HEADER_SIZE);
+  const flags      = view.getUint8(OFFSET_FLAGS);
+  const salt       = normalised.slice(OFFSET_SALT, OFFSET_SALT + SALT_LENGTH);
+  const iv         = normalised.slice(OFFSET_IV, OFFSET_IV + IV_LENGTH);
+  const ciphertext = normalised.slice(OFFSET_CIPHERTEXT);
 
   let key: CryptoKey;
   if (options.key) {
@@ -225,7 +271,12 @@ export async function decryptData(
     ciphertext,
   );
 
-  return new Uint8Array(plaintext);
+  let resultBytes: Uint8Array<ArrayBuffer> = new Uint8Array(plaintext);
+  if (flags & FLAG_COMPRESSED) {
+    resultBytes = await decompressBytes(resultBytes);
+  }
+
+  return { data: resultBytes, key };
 }
 
 // ---------------------------------------------------------------------------

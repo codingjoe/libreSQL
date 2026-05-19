@@ -12,7 +12,8 @@ libreSQL lets you load, query, and persist AES-256-GCM encrypted SQLite database
 flowchart LR
     subgraph Browser["Browser (trusted context)"]
         direction TB
-        P["Password"] -->|PBKDF2-SHA256| K["AES-256-GCM key"]
+        P["Password"] -->|PBKDF2-SHA256| K["AES-256-GCM key\n(non-extractable)"]
+        K --> KeyStore["KeyStore\n(module-private)"]
         K -->|decrypt in memory| SQL["sql.js WASM"]
         SQL --> Q["SQL queries"]
     end
@@ -30,20 +31,20 @@ Only the **encrypted blob** crosses the network. The key and plaintext SQL data 
 ## Installation
 
 ```bash
-npm install libresql
+npm install libresql sql.js
 ```
 
 ---
 
 ## Quick start
 
-### Load an encrypted database from a URL
+### Open an encrypted database
 
 ```ts
 import { LibreSQL, KeyStore, deriveKey } from 'libresql';
 
-// Derive the key once at login and keep it in the secure session store
-const key = await deriveKey(password, salt);
+// Derive the key once at login (store the salt in the user's profile on the server)
+const key = await deriveKey(password, storedSalt);
 KeyStore.set('main', key);
 
 // Load and decrypt — entirely in the browser
@@ -51,20 +52,16 @@ const db = await LibreSQL.fromURL('https://cdn.example.com/files.lsql', {
   key: KeyStore.get('main')!,
 });
 
-// Full-text-style search on file metadata
+// Query — reads do not trigger onWrite
 const [result] = db.exec(
   "SELECT id, name FROM files WHERE name LIKE ? ORDER BY name",
   ['%.pdf'],
 );
 
-for (const [id, name] of result.values) {
-  console.log(id, name);
-}
-
 db.close(); // frees WASM memory
 ```
 
-### Load from a `<input type="file">` picker
+### Open from a file picker
 
 ```ts
 input.addEventListener('change', async () => {
@@ -75,150 +72,135 @@ input.addEventListener('change', async () => {
 });
 ```
 
-### Create a database and encrypt it for upload
+### Create a database and push it on every write
+
+Extend `LibreSQL` and override `onWrite()` to react automatically to every
+write operation:
 
 ```ts
 import { LibreSQL, KeyStore } from 'libresql';
 
-const db = await LibreSQL.create();
+class CloudDB extends LibreSQL {
+  protected override onWrite(): void {
+    void this.encrypt().then(blob =>
+      fetch('/api/db', { method: 'PUT', body: blob })
+    );
+  }
+}
+
+const db = await CloudDB.create({ key: KeyStore.get('main')! });
 db.run('CREATE TABLE files (id INTEGER PRIMARY KEY, name TEXT, size INTEGER)');
-db.run('INSERT INTO files VALUES (?, ?, ?)', [1, 'report.pdf', 4096]);
+// ^ onWrite() fires automatically — the encrypted blob is pushed to the server
+```
 
-// Encrypt and upload — the server only ever receives ciphertext
-const encrypted = await db.encrypt({ key: KeyStore.get('main')! });
-await fetch('/api/db', { method: 'PUT', body: encrypted });
+### Migrate an existing SQLite database
 
+```ts
+const raw = await fetch('/legacy/app.sqlite').then(r => r.arrayBuffer());
+const db  = await LibreSQL.fromPlainBuffer(raw, { key: KeyStore.get('main')! });
+
+// Encrypt and push — server only ever receives ciphertext from now on
+const blob = await db.encrypt();
+await fetch('/api/db', { method: 'PUT', body: blob });
 db.close();
 ```
 
 ---
 
-## Secure key storage
-
-Never put the user's key in `localStorage`, `sessionStorage`, or a cookie.
-Those are accessible to other scripts or transmitted to the server.
-
-libreSQL ships a `KeyStore` that keeps **non-extractable `CryptoKey` objects
-in module-private memory** — they cannot be read or serialised by any script
-and are never sent over the network.
-
-```ts
-import { KeyStore, deriveKey } from 'libresql';
-
-// — Login —
-const salt = /* load from your server or user profile */;
-const key  = await deriveKey(userPassword, salt);   // non-extractable
-KeyStore.set('main', key);                          // in-memory only
-
-// — Per-operation usage —
-const db = await LibreSQL.fromURL(url, { key: KeyStore.get('main')! });
-
-// — Logout —
-KeyStore.delete('main');   // or KeyStore.clear() to wipe everything
-```
-
-The key lives only for the current tab/page lifetime.  On a hard reload the
-user must re-authenticate — which is the correct E2EE behaviour.
-
----
-
 ## Multi-client consistency
 
-When the same user has the application open on multiple devices (e.g. phone
-and laptop), you need a strategy for keeping the local and remote copies in sync.
+When the same application is open on multiple devices (e.g. phone and laptop)
+you need a strategy for keeping copies in sync.
 
 ### Push-on-write
 
-The simplest safe model is **push-on-write**: every time a write transaction
-completes, re-encrypt and upload the whole database.
+The recommended default: re-encrypt and upload after every write.  Extend
+`LibreSQL` with an `onWrite()` override as shown above.  Because each
+encryption uses a fresh random IV and salt, the server sees a different
+ciphertext every time and can use its blob hash as a write sequence number.
+
+### Version comparison with `db.digest()`
+
+Check whether a sync is needed without downloading the full blob:
 
 ```ts
-async function saveDatabase(db: LibreSQL, key: CryptoKey, url: string) {
-  const blob = await db.encrypt({ key });
-  await fetch(url, { method: 'PUT', body: blob });
-}
-```
-
-Because each encryption uses a fresh random IV and salt, the server can
-compare ETags or SHA-256 hashes to detect concurrent writes without reading
-the plaintext.
-
-### Version comparison with `digestBlob`
-
-Avoid downloading the whole database just to check whether it changed.
-Instead, let the server expose a lightweight hash endpoint and compare it
-against the blob you already hold locally:
-
-```ts
-import { LibreSQL } from 'libresql';
-
-// Check whether the remote copy is newer — no full download needed
-const localDigest  = await LibreSQL.digestBlob(localEncryptedBlob);
-const remoteDigest = await fetch('/api/db.lsql.sha256').then(r => r.text());
+// Server exposes a lightweight hash of the current plaintext content
+const localDigest  = await db.digest();
+const remoteDigest = await fetch('/api/db.sha256').then(r => r.text());
 
 if (localDigest !== remoteDigest) {
-  // Remote is newer — fetch, decrypt, and reload
-  const db = await LibreSQL.fromURL('/api/db.lsql', { key });
+  // Remote has newer data — fetch, decrypt, and reload
+  const db2 = await LibreSQL.fromURL('/api/db.lsql', { key: KeyStore.get('main')! });
 }
 ```
 
-The server computes `SHA-256(encrypted_blob)` and serves it as a tiny text
-file alongside the database. This is cheap to compare and requires no
-knowledge of the plaintext.
+`digest()` hashes the raw SQLite bytes — two database instances with the same
+data always produce the same digest, regardless of when they were encrypted.
+
+### Key rotation
+
+Replace the key stored in the instance without re-opening the database:
+
+```ts
+const newKey = await generateKey();
+db.rotateKey(newKey);
+KeyStore.set('main', newKey);
+
+// Next encrypt() call uses the new key automatically
+const blob = await db.encrypt();
+await fetch('/api/db', { method: 'PUT', body: blob });
+```
 
 ### Durability with a Service Worker
 
-A Service Worker can keep the in-memory database alive across accidental tab
-closures by holding a reference to the encrypted blob in its module scope:
+Use a Service Worker to keep the latest encrypted blob alive across accidental
+tab closures.  The key is **never** sent to the SW.
+
+**`sw.js`**
 
 ```ts
-// sw.js
-let latestBlob: ArrayBuffer | null = null;
+import { ServiceWorkerStorage } from 'libresql/sw';
 
-self.addEventListener('message', (event) => {
-  if (event.data.type === 'SAVE_DB') {
-    // The page sends the encrypted blob; the SW caches it in memory
-    latestBlob = event.data.payload;
-  }
-  if (event.data.type === 'LOAD_DB') {
-    event.source?.postMessage({ type: 'DB_BLOB', payload: latestBlob });
-  }
+const storage = new ServiceWorkerStorage();
+self.addEventListener('message', (e) => storage.handleMessage(e));
+```
+
+**`app.ts`**
+
+```ts
+import { LibreSQL, KeyStore } from 'libresql';
+import { saveToServiceWorker, loadFromServiceWorker } from 'libresql/sw';
+
+// On startup — restore from SW cache or fetch from server
+const cached = await loadFromServiceWorker();
+const db = cached
+  ? await LibreSQL.fromBuffer(cached, { key: KeyStore.get('main')! })
+  : await LibreSQL.fromURL('/api/db.lsql', { key: KeyStore.get('main')! });
+
+// Save to SW before unload
+window.addEventListener('beforeunload', () => {
+  void db.encrypt().then(saveToServiceWorker);
 });
 ```
 
-```ts
-// app.ts — persist before unload
-window.addEventListener('beforeunload', async () => {
-  const blob = await db.encrypt({ key: KeyStore.get('main')! });
-  navigator.serviceWorker.controller?.postMessage(
-    { type: 'SAVE_DB', payload: blob.buffer },
-    [blob.buffer],        // transfer, not copy
-  );
-});
-```
-
-The key is **never** sent to the Service Worker — only the encrypted blob.
-When the tab reopens, it fetches the blob from the SW and decrypts it locally
-with the key re-derived from the user's password.
+> **Advanced pattern:** The database can live entirely inside the Service
+> Worker (shared across all tabs), with tabs sending SQL messages via
+> `postMessage` and the SW executing queries and pushing results back.
+> This eliminates per-tab copies and is ideal for high-concurrency
+> applications.  Use a `BroadcastChannel` or SW `fetch` interception for
+> a clean API boundary.
 
 ### Compression
 
-For large databases you can shrink the transfer size using the Baseline
-[`CompressionStream` API](https://developer.mozilla.org/en-US/docs/Web/API/CompressionStream)
-**before** encryption:
+`db.encrypt()` compresses the SQLite bytes with DEFLATE-raw and runs `VACUUM`
+by default, keeping the blob as small as possible:
 
 ```ts
-async function compress(data: Uint8Array): Promise<Uint8Array> {
-  const cs = new CompressionStream('gzip');
-  const writer = cs.writable.getWriter();
-  writer.write(data);
-  writer.close();
-  return new Uint8Array(await new Response(cs.readable).arrayBuffer());
-}
+// Default: compress=true, vacuum=true
+const blob = await db.encrypt();
 
-// Compress the raw SQLite bytes, then encrypt
-const compressed = await compress(db.export());
-const blob = await encryptData(compressed, { key });
+// Opt out of compression for latency-sensitive writes
+const blobFast = await db.encrypt({ compress: false, vacuum: false });
 ```
 
 ---
@@ -227,88 +209,137 @@ const blob = await encryptData(compressed, { key });
 
 ### `LibreSQL` class
 
-#### Factory methods (open encrypted)
+#### Open an encrypted database
 
 | Method | Description |
 |--------|-------------|
 | `LibreSQL.fromURL(url, options, init?)` | Fetch an encrypted blob from a URL and open it. |
-| `LibreSQL.fromFile(file, options)` | Open an encrypted `File` (e.g. from `<input type="file">`). |
+| `LibreSQL.fromFile(file, options)` | Open an encrypted `File` (from `<input type="file">`). |
 | `LibreSQL.fromBuffer(buffer, options)` | Open an encrypted `ArrayBuffer` or `Uint8Array`. |
 
-All `options` accept either `{ password: string }` or `{ key: CryptoKey }`.
+`options` accepts `{ password: string }` or `{ key: CryptoKey }`.  The
+resolved key is stored in the instance automatically.
 
-#### Factory methods (plaintext / bootstrapping)
+#### Create a new database
 
 | Method | Description |
 |--------|-------------|
-| `LibreSQL.create(options?)` | Create a new, empty in-memory SQLite database. |
-| `LibreSQL.fromPlainBuffer(buffer, options?)` | Open a raw (unencrypted) SQLite file. |
+| `LibreSQL.create(options)` | Create a new, empty in-memory SQLite database. |
+| `LibreSQL.fromPlainBuffer(buffer, options)` | Open a raw (unencrypted) SQLite file for migration. |
 
-#### Instance methods
+`options` requires a `key: CryptoKey`.
+
+#### Read
 
 | Method | Description |
 |--------|-------------|
 | `db.exec(sql, params?)` | Execute SQL, returns `QueryResult[]`. |
-| `db.run(sql, params?)` | Execute a data-modification statement (returns `this` for chaining). |
-| `db.export()` | Export as raw (unencrypted) SQLite `Uint8Array`. |
-| `db.encrypt(options)` | Export as an encrypted LibreSQL `Uint8Array`. |
-| `db.close()` | Close the database and free WASM memory. |
 
-#### Static utilities
+#### Write
 
 | Method | Description |
 |--------|-------------|
-| `LibreSQL.digestBlob(blob)` | SHA-256 hex digest of an encrypted blob (for version comparison). |
+| `db.run(sql, params?)` | Execute a data-modification statement; triggers `onWrite()`. Returns `this`. |
+| `db.onWrite()` _(protected)_ | Override in a subclass to react to writes (push-on-write pattern). |
 
-### `KeyStore`
+#### Persistence
 
-In-memory session store for non-extractable `CryptoKey` objects.
+| Method | Description |
+|--------|-------------|
+| `db.encrypt(options?)` | Encrypt the database (VACUUM + compress by default) and return a `Uint8Array`. |
+| `db.digest()` | SHA-256 hex of the current database content — stable across instances with the same data. |
+
+#### Key management
 
 | Method / Property | Description |
 |-------------------|-------------|
-| `KeyStore.set(id, key)` | Store a key under `id`. |
-| `KeyStore.get(id)` | Retrieve a key, or `undefined`. |
-| `KeyStore.has(id)` | Returns `true` if a key exists for `id`. |
-| `KeyStore.delete(id)` | Remove the key for `id`. |
-| `KeyStore.clear()` | Remove all keys (call on logout). |
-| `KeyStore.size` | Number of keys currently held. |
+| `db.key` | The `CryptoKey` stored in this instance (non-extractable). |
+| `db.rotateKey(newKey)` | Replace the stored key; takes effect on the next `encrypt()` call. |
 
-### Crypto helpers
+#### Lifecycle
 
-```ts
-import {
-  deriveKey,    // PBKDF2-SHA256 key derivation
-  generateKey,  // random AES-256-GCM key
-  importRawKey, // import 32 raw bytes as a CryptoKey
-  encryptData,  // encrypt arbitrary bytes → LibreSQL blob
-  decryptData,  // decrypt a LibreSQL blob → plaintext bytes
-} from 'libresql';
-```
+| Method | Description |
+|--------|-------------|
+| `db.close()` | Close the database and free WASM memory. |
 
 ---
 
-## Security design
+## Security
+
+### Cryptographic design
 
 | Property | Mechanism |
 |----------|-----------|
 | Confidentiality | AES-256-GCM — IND-CCA2 secure |
-| Integrity / authenticity | AES-GCM 128-bit authentication tag (tamper detection) |
-| Key derivation | PBKDF2-SHA256, 600 000 iterations (≥ 2× the 2025 OWASP minimum of 310 000) |
+| Integrity / authenticity | AES-GCM 128-bit authentication tag — tamper detection built-in |
+| Key derivation | PBKDF2-SHA256, 600 000 iterations — ≥ 2× the 2025 OWASP minimum of 310 000 |
 | Random values | `crypto.getRandomValues` — cryptographically secure |
-| Key isolation | Non-extractable `CryptoKey` objects; raw bytes never accessible to JS |
-| Session key storage | Module-private `KeyStore` — not in cookies, storage APIs, or globals |
-| Data residency | SQLite bytes exist only in WASM memory; never serialised to the network |
+| Key isolation | Non-extractable `CryptoKey` objects — raw bytes never accessible to JavaScript |
+| Session key storage | `KeyStore` is module-private — not in cookies, storage APIs, or globals |
+| Data residency | SQLite bytes exist only in WASM memory — never serialised to the network in plaintext |
 
-The design is inspired by the approaches used by [Proton](https://proton.me/security) and [Ente](https://ente.io/blog/e2ee/): encrypt data client-side before it leaves the device, with keys derived from user-owned secrets.
+The design follows the client-side-encrypt-before-upload pattern used by
+[Proton](https://proton.me/security) and [Ente](https://ente.io/blog/e2ee/).
+
+### Storing the key securely
+
+Never put the user's key in `localStorage`, `sessionStorage`, or a cookie:
+
+| Storage | Problem |
+|---------|---------|
+| `localStorage` / `sessionStorage` | Accessible by any same-origin script; serialised as plain text |
+| `document.cookie` | Transmitted with every HTTP request to the origin |
+| Custom window/global property | Readable by any same-origin script |
+
+`KeyStore` keeps `CryptoKey` objects in a **module-private `Map`**.  Because
+the keys are non-extractable, raw bytes can never be read or serialised:
+
+```ts
+import { KeyStore, deriveKey } from 'libresql';
+
+// — Login —
+const salt = /* load from server or user profile */;
+const key  = await deriveKey(userPassword, salt);  // non-extractable
+KeyStore.set('main', key);
+
+// — Per-operation usage —
+const db = await LibreSQL.fromURL(url, { key: KeyStore.get('main')! });
+
+// — Logout —
+KeyStore.delete('main');  // or KeyStore.clear() to wipe everything
+```
+
+The key lives only for the current tab's lifetime.  On a hard reload the user
+re-authenticates — which is the correct E2EE behaviour.
+
+### Password-based vs key-based workflow
+
+When you open a database with a **password**, libreSQL derives the
+AES-256-GCM key from the PBKDF2 salt embedded in the blob header and stores
+it in the instance.  Subsequent `encrypt()` calls use the stored key directly
+(no PBKDF2 re-derivation).  To decrypt the resulting blob, the same key is
+required.
+
+The **recommended workflow** is therefore:
+
+1. Derive the key once per session: `const key = await deriveKey(pw, storedSalt)`
+2. Store it: `KeyStore.set('main', key)`
+3. Open the database: `LibreSQL.fromURL(url, { key })`
+4. All subsequent operations use the stored key — no password re-entry needed
+
+Store the **salt** (not the password) server-side in the user's profile.  The
+salt is not secret and is needed to re-derive the same key from the same
+password on the next session.
 
 ---
 
 ## Browser compatibility
 
 libreSQL uses only [Baseline](https://web.dev/baseline) widely available APIs:
-- **Web Crypto API** (`crypto.subtle`)
-- **WebAssembly**
-- **`CompressionStream`** (optional, for the compression pattern above)
+- **Web Crypto API** (`crypto.subtle`) — key derivation, AES-GCM
+- **WebAssembly** — sql.js (SQLite in the browser)
+- **`CompressionStream` / `DecompressionStream`** — DEFLATE-raw compression (used in `encrypt()`)
+- **`fetch`** — for `fromURL()`
 
 ---
 
@@ -320,12 +351,7 @@ libreSQL uses only [Baseline](https://web.dev/baseline) widely available APIs:
 | 4 | 1 B | File format version (`0x01`) |
 | 5 | 1 B | KDF identifier (`0x00` = PBKDF2-SHA256) |
 | 6 | 4 B | PBKDF2 iteration count (big-endian uint32) |
-| 10 | 32 B | PBKDF2 salt (random, unique per encryption) |
-| 42 | 12 B | AES-GCM nonce / IV (random, unique per encryption) |
-| 54 | … | AES-GCM ciphertext (SQLite bytes + 16-byte auth tag) |
-
----
-
-## License
-
-BSD 2-Clause © Johannes Maron
+| 10 | 1 B | Flags (bit 0 = `FLAG_COMPRESSED`) |
+| 11 | 32 B | PBKDF2 salt (random, unique per encryption) |
+| 43 | 12 B | AES-GCM nonce / IV (random, unique per encryption) |
+| 55 | … | AES-GCM ciphertext (optionally DEFLATE-raw compressed plaintext + 16-byte auth tag) |

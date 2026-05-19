@@ -3,8 +3,6 @@
   "version": "1.0.0",
   "description": "Browser-based E2EE SQLite database for end-to-end encrypted SaaS applications",
   "type": "module",
-  "main": "./dist/index.cjs",
-  "module": "./dist/index.mjs",
   "types": "./dist/types/index.d.ts",
   "exports": {
     ".": {
@@ -43,13 +41,14 @@
     "url": "https://github.com/codingjoe/libreSQL/issues"
   },
   "homepage": "https://github.com/codingjoe/libreSQL#readme",
-  "peerDependencies": {},
-  "dependencies": {
+  "peerDependencies": {
     "sql.js": "^1.14.1"
   },
+  "dependencies": {},
   "devDependencies": {
     "@types/sql.js": "^1.4.11",
     "@vitest/coverage-v8": "^4.1.6",
+    "sql.js": "^1.14.1",
     "typescript": "^6.0.3",
     "vite": "^6.4.2",
     "vitest": "^4.1.6"

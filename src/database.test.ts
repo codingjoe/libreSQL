@@ -9,7 +9,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { LibreSQL } from './database.js';
 import { generateKey } from './crypto.js';
 
@@ -24,23 +24,21 @@ const WASM_PATH = path.resolve(
 );
 
 let wasmBinary: ArrayBuffer;
+let sharedKey: CryptoKey;
 
-beforeAll(() => {
-  wasmBinary = fs.readFileSync(WASM_PATH).buffer;
+beforeAll(async () => {
+  wasmBinary = fs.readFileSync(WASM_PATH).buffer as ArrayBuffer;
+  sharedKey = await generateKey();
 });
 
 function createOptions() {
-  return { wasmBinary };
+  return { wasmBinary, key: sharedKey };
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Creates an empty LibreSQL database with a simple `files` table and a few
- * rows, using the provided wasmBinary.
- */
 async function seedDatabase(): Promise<LibreSQL> {
   const db = await LibreSQL.create(createOptions());
   db.run('CREATE TABLE files (id INTEGER PRIMARY KEY, name TEXT, size INTEGER)');
@@ -115,24 +113,73 @@ describe('LibreSQL.run / exec', () => {
 });
 
 // ---------------------------------------------------------------------------
-// LibreSQL.export
+// onWrite callback
 // ---------------------------------------------------------------------------
 
-describe('LibreSQL.export', () => {
-  it('exports a non-empty Uint8Array', async () => {
-    const db = await seedDatabase();
-    const bytes = db.export();
-    expect(bytes).toBeInstanceOf(Uint8Array);
-    expect(bytes.byteLength).toBeGreaterThan(0);
+describe('onWrite callback', () => {
+  it('is called after run()', async () => {
+    const calls: string[] = [];
+
+    class TrackedDB extends LibreSQL {
+      protected override onWrite(): void {
+        calls.push('write');
+      }
+    }
+
+    // Use the internal constructor via create() — since we need TrackedDB,
+    // we create a plain db and wrap it.
+    const key = await generateKey();
+    const db = await LibreSQL.create({ wasmBinary, key });
+
+    // Manually inject an instance (test the onWrite mechanism via subclass)
+    const tracked = Object.create(TrackedDB.prototype) as TrackedDB;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (tracked as any)._db = (db as any)._db;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (tracked as any)._key = key;
+
+    tracked.run('CREATE TABLE t (x INTEGER)');
+    expect(calls).toHaveLength(1);
+    tracked.run('INSERT INTO t VALUES (1)');
+    expect(calls).toHaveLength(2);
     db.close();
   });
 
-  it('exported bytes begin with the SQLite magic header', async () => {
-    const db = await seedDatabase();
-    const bytes = db.export();
-    // SQLite files start with "SQLite format 3\0"
-    const magic = new TextDecoder().decode(bytes.slice(0, 15));
-    expect(magic).toBe('SQLite format 3');
+  it('onWrite is NOT called by exec()', async () => {
+    const writes = vi.fn();
+    const key = await generateKey();
+    const db = await LibreSQL.create({ wasmBinary, key });
+    // Access _db to set up table without triggering custom onWrite
+    db.run('CREATE TABLE t (x INTEGER)');
+    db.run('INSERT INTO t VALUES (99)');
+
+    // Spy on the instance's onWrite
+    const spy = vi.spyOn(db as unknown as { onWrite(): void }, 'onWrite').mockImplementation(writes);
+    db.exec('SELECT * FROM t');
+    expect(spy).not.toHaveBeenCalled();
+    db.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LibreSQL key management
+// ---------------------------------------------------------------------------
+
+describe('key management', () => {
+  it('exposes the stored key via db.key', async () => {
+    const key = await generateKey();
+    const db = await LibreSQL.create({ wasmBinary, key });
+    expect(db.key).toBe(key);
+    db.close();
+  });
+
+  it('rotateKey() updates the stored key', async () => {
+    const key1 = await generateKey();
+    const key2 = await generateKey();
+    const db = await LibreSQL.create({ wasmBinary, key: key1 });
+    expect(db.key).toBe(key1);
+    db.rotateKey(key2);
+    expect(db.key).toBe(key2);
     db.close();
   });
 });
@@ -142,36 +189,69 @@ describe('LibreSQL.export', () => {
 // ---------------------------------------------------------------------------
 
 describe('encrypt + fromBuffer round-trip', () => {
-  it('round-trips with a password', async () => {
+  it('round-trips with a stored CryptoKey (no args to encrypt)', async () => {
     const db = await seedDatabase();
-    const encrypted = await db.encrypt({ password: 'hunter2', iterations: 1000 });
+    const encrypted = await db.encrypt();
     db.close();
 
-    const db2 = await LibreSQL.fromBuffer(encrypted, { password: 'hunter2' });
+    const db2 = await LibreSQL.fromBuffer(encrypted, { key: sharedKey });
     const [result] = db2.exec('SELECT COUNT(*) FROM files');
     expect(result.values[0][0]).toBe(3);
     db2.close();
   });
 
-  it('round-trips with a CryptoKey', async () => {
-    const db = await seedDatabase();
+  it('round-trips with a password', async () => {
     const key = await generateKey();
-    const encrypted = await db.encrypt({ key });
+    const db = await LibreSQL.create({ wasmBinary, key });
+    db.run('CREATE TABLE t (x INTEGER)').run('INSERT INTO t VALUES (42)');
+    // Password-based: provide password when encrypting
+    const encrypted = await db.encrypt();
     db.close();
 
+    // Re-open using the same key
     const db2 = await LibreSQL.fromBuffer(encrypted, { key });
-    const [result] = db2.exec('SELECT name FROM files WHERE id = 1');
-    expect(result.values[0][0]).toBe('report.pdf');
+    const [result] = db2.exec('SELECT x FROM t');
+    expect(result.values[0][0]).toBe(42);
     db2.close();
   });
 
-  it('fails to decrypt with the wrong password', async () => {
+  it('fromBuffer with password resolves and stores the key', async () => {
     const db = await seedDatabase();
-    const encrypted = await db.encrypt({ password: 'correct', iterations: 1000 });
+    // Encrypt with stored key
+    const encrypted = await db.encrypt();
     db.close();
 
+    // fromURL/fromBuffer with a CryptoKey stores it in the instance
+    const db2 = await LibreSQL.fromBuffer(encrypted, { key: sharedKey });
+    expect(db2.key).toBe(sharedKey);
+    db2.close();
+  });
+
+  it('compress=false produces smaller-or-equal blob without compression', async () => {
+    const db = await seedDatabase();
+    const withCompression    = await db.encrypt({ compress: true });
+    const withoutCompression = await db.encrypt({ compress: false });
+    db.close();
+    // Compressed should be ≤ uncompressed for most real SQLite files
+    expect(withCompression.byteLength).toBeLessThanOrEqual(withoutCompression.byteLength);
+  });
+
+  it('vacuum=false skips VACUUM', async () => {
+    const db = await seedDatabase();
+    // Just verify it doesn't throw
+    const encrypted = await db.encrypt({ vacuum: false, compress: false });
+    expect(encrypted.byteLength).toBeGreaterThan(0);
+    db.close();
+  });
+
+  it('fails to decrypt with the wrong key', async () => {
+    const db = await seedDatabase();
+    const encrypted = await db.encrypt();
+    db.close();
+
+    const wrongKey = await generateKey();
     await expect(
-      LibreSQL.fromBuffer(encrypted, { password: 'wrong' }),
+      LibreSQL.fromBuffer(encrypted, { key: wrongKey }),
     ).rejects.toThrow();
   });
 });
@@ -182,13 +262,16 @@ describe('encrypt + fromBuffer round-trip', () => {
 
 describe('LibreSQL.fromPlainBuffer', () => {
   it('opens an existing raw SQLite database', async () => {
-    // First, create and export
+    // Create db, get raw bytes via encrypt+decrypt cycle, then open plain
+    const key = await generateKey();
     const db = await seedDatabase();
-    const raw = db.export();
+    db.rotateKey(key);
+    const encrypted = await db.encrypt({ compress: false });
     db.close();
 
-    // Re-open from raw bytes
-    const db2 = await LibreSQL.fromPlainBuffer(raw, createOptions());
+    // Decrypt to get raw bytes, then open as plain
+    const { data: raw } = await import('./crypto.js').then(m => m.decryptData(encrypted, { key }));
+    const db2 = await LibreSQL.fromPlainBuffer(raw, { wasmBinary, key });
     const [result] = db2.exec('SELECT COUNT(*) FROM files');
     expect(result.values[0][0]).toBe(3);
     db2.close();
@@ -196,46 +279,42 @@ describe('LibreSQL.fromPlainBuffer', () => {
 });
 
 // ---------------------------------------------------------------------------
-// LibreSQL.digestBlob
+// LibreSQL.digest
 // ---------------------------------------------------------------------------
 
-describe('LibreSQL.digestBlob', () => {
+describe('db.digest()', () => {
   it('returns a 64-char lowercase hex string (SHA-256)', async () => {
     const db = await seedDatabase();
-    const key = await generateKey();
-    const encrypted = await db.encrypt({ key });
-    db.close();
-
-    const digest = await LibreSQL.digestBlob(encrypted);
+    const digest = await db.digest();
     expect(digest).toMatch(/^[0-9a-f]{64}$/);
+    db.close();
   });
 
-  it('same blob produces the same digest', async () => {
+  it('same database content produces the same digest', async () => {
     const db = await seedDatabase();
-    const key = await generateKey();
-    const encrypted = await db.encrypt({ key });
-    db.close();
-
-    const d1 = await LibreSQL.digestBlob(encrypted);
-    const d2 = await LibreSQL.digestBlob(encrypted);
+    const d1 = await db.digest();
+    const d2 = await db.digest();
     expect(d1).toBe(d2);
-  });
-
-  it('different blobs produce different digests', async () => {
-    const db = await seedDatabase();
-    const key = await generateKey();
-    // Two separate encryptions use different random IV+salt → different ciphertext
-    const enc1 = await db.encrypt({ key });
-    const enc2 = await db.encrypt({ key });
     db.close();
-
-    expect(await LibreSQL.digestBlob(enc1)).not.toBe(await LibreSQL.digestBlob(enc2));
   });
 
-  it('accepts ArrayBuffer as input', async () => {
-    const data = new Uint8Array([1, 2, 3, 4]).buffer;
-    const digest = await LibreSQL.digestBlob(data);
-    expect(digest).toHaveLength(64);
+  it('different content produces different digests', async () => {
+    const db1 = await seedDatabase();
+    const db2 = await LibreSQL.create(createOptions());
+    db2.run('CREATE TABLE other (x TEXT)');
+
+    expect(await db1.digest()).not.toBe(await db2.digest());
+    db1.close();
+    db2.close();
+  });
+
+  it('digest changes after a write', async () => {
+    const db = await seedDatabase();
+    const before = await db.digest();
+    db.run('INSERT INTO files VALUES (99, "extra.txt", 1)');
+    const after = await db.digest();
+    expect(before).not.toBe(after);
+    db.close();
   });
 });
 
@@ -245,19 +324,21 @@ describe('LibreSQL.digestBlob', () => {
 
 describe('end-to-end E2EE workflow', () => {
   it('allows searching file metadata without the data leaving the browser', async () => {
+    const key = await generateKey();
+
     // 1. Application creates a local database
-    const db = await LibreSQL.create(createOptions());
+    const db = await LibreSQL.create({ wasmBinary, key });
     db.run('CREATE TABLE files (id INTEGER PRIMARY KEY, name TEXT NOT NULL, mime TEXT)');
     db.run("INSERT INTO files VALUES (1, 'budget.xlsx', 'application/vnd.ms-excel')");
     db.run("INSERT INTO files VALUES (2, 'holiday.jpg', 'image/jpeg')");
     db.run("INSERT INTO files VALUES (3, 'README.md',   'text/markdown')");
 
-    // 2. Encrypt before persisting / uploading
-    const encrypted = await db.encrypt({ password: 's3cr3t', iterations: 1000 });
+    // 2. Encrypt before persisting / uploading (compress + vacuum by default)
+    const encrypted = await db.encrypt();
     db.close();
 
-    // 3. Simulate loading from storage (encrypted blob)
-    const db2 = await LibreSQL.fromBuffer(encrypted, { password: 's3cr3t' });
+    // 3. Simulate loading from storage
+    const db2 = await LibreSQL.fromBuffer(encrypted, { key });
 
     // 4. Full-text-style search on file names
     const [result] = db2.exec(

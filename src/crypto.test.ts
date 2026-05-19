@@ -99,14 +99,38 @@ describe('encryptData + decryptData', () => {
       password: 'test-password',
       iterations: 1000,
     });
-    const decrypted = await decryptData(encrypted, { password: 'test-password' });
+    const { data: decrypted } = await decryptData(encrypted, { password: 'test-password' });
     expect(decrypted).toEqual(PLAINTEXT);
   });
 
   it('round-trips with a CryptoKey', async () => {
     const key = await generateKey();
     const encrypted = await encryptData(PLAINTEXT, { key });
-    const decrypted = await decryptData(encrypted, { key });
+    const { data: decrypted } = await decryptData(encrypted, { key });
+    expect(decrypted).toEqual(PLAINTEXT);
+  });
+
+  it('decryptData returns the resolved key', async () => {
+    const key = await generateKey();
+    const encrypted = await encryptData(PLAINTEXT, { key });
+    const { key: returnedKey } = await decryptData(encrypted, { key });
+    expect(returnedKey).toBe(key);
+  });
+
+  it('decryptData returns the derived key when password is used', async () => {
+    const encrypted = await encryptData(PLAINTEXT, {
+      password: 'test-password',
+      iterations: 1000,
+    });
+    const { key } = await decryptData(encrypted, { password: 'test-password' });
+    expect(key).toBeDefined();
+    expect(key.type).toBe('secret');
+  });
+
+  it('round-trips with compression enabled', async () => {
+    const key = await generateKey();
+    const encrypted = await encryptData(PLAINTEXT, { key, compress: true });
+    const { data: decrypted } = await decryptData(encrypted, { key });
     expect(decrypted).toEqual(PLAINTEXT);
   });
 
@@ -122,8 +146,9 @@ describe('encryptData + decryptData', () => {
     expect(encrypted.slice(0, 4)).toEqual(HEADER_MAGIC);
   });
 
-  it('encrypted blob is larger than the header + plaintext by the GCM tag', async () => {
-    const encrypted = await encryptData(PLAINTEXT, { password: 'pw', iterations: 1000 });
+  it('uncompressed blob size equals HEADER_SIZE + plaintext + GCM tag', async () => {
+    const key = await generateKey();
+    const encrypted = await encryptData(PLAINTEXT, { key, compress: false });
     // AES-GCM appends a 16-byte tag
     expect(encrypted.byteLength).toBe(HEADER_SIZE + PLAINTEXT.byteLength + 16);
   });
@@ -155,8 +180,7 @@ describe('encryptData + decryptData', () => {
   });
 
   it('uses DEFAULT_ITERATIONS when none specified', async () => {
-    // We only test the encoded value in the header to avoid a slow PBKDF2 run.
-    // Use a CryptoKey so key derivation is skipped.
+    // Use a CryptoKey so key derivation is skipped (fast test).
     const key = await generateKey();
     const encrypted = await encryptData(PLAINTEXT, { key, iterations: DEFAULT_ITERATIONS });
     const view = new DataView(encrypted.buffer);

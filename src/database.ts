@@ -1,21 +1,36 @@
 /**
  * LibreSQL – E2EE SQLite for the browser.
  *
- * Typical usage (loading an encrypted database from a remote URL):
+ * @example
  * ```ts
- * import { LibreSQL } from 'libresql';
+ * import { LibreSQL, KeyStore, deriveKey } from 'libresql';
  *
+ * // Derive key once at login and keep it in the secure in-memory store
+ * const key = await deriveKey(password, salt);
+ * KeyStore.set('main', key);
+ *
+ * // Load an encrypted database from a remote URL
  * const db = await LibreSQL.fromURL('https://cdn.example.com/app.lsql', {
- *   password: 'hunter2',
+ *   key: KeyStore.get('main')!,
  * });
- * const results = db.exec('SELECT * FROM files WHERE name LIKE ?', ['%.pdf']);
+ *
+ * const [result] = db.exec('SELECT * FROM files WHERE name LIKE ?', ['%.pdf']);
+ * console.log(result.values);
+ *
  * db.close();
  * ```
  */
 
 import initSqlJs, { Database, BindParams, QueryExecResult } from 'sql.js';
 import { decryptData, encryptData } from './crypto.js';
-import { BindParams as LibreBindParams, CreateOptions, EncryptOptions, OpenOptions, QueryResult } from './types.js';
+import {
+  BindParams as LibreBindParams,
+  CreateOptions,
+  DatabaseEncryptOptions,
+  OpenOptions,
+  QueryResult,
+  WasmOptions,
+} from './types.js';
 
 // ---------------------------------------------------------------------------
 // WASM bootstrap helper
@@ -23,13 +38,7 @@ import { BindParams as LibreBindParams, CreateOptions, EncryptOptions, OpenOptio
 
 let _sqlJsPromise: ReturnType<typeof initSqlJs> | undefined;
 
-/**
- * Returns a (cached) sql.js module.  The WASM binary is loaded from the
- * local `sql-wasm.wasm` asset by default, which Vite/bundlers will resolve
- * automatically.  Pass a custom `locateFile` via `CreateOptions.wasmBinaryPath`
- * to override.
- */
-async function getSqlJs(options?: CreateOptions): ReturnType<typeof initSqlJs> {
+async function getSqlJs(options?: WasmOptions): ReturnType<typeof initSqlJs> {
   if (_sqlJsPromise) return _sqlJsPromise;
 
   const config: Parameters<typeof initSqlJs>[0] = {};
@@ -51,23 +60,44 @@ async function getSqlJs(options?: CreateOptions): ReturnType<typeof initSqlJs> {
 /**
  * A browser-based, end-to-end encrypted SQLite database.
  *
- * Databases are encrypted at rest and in transit using AES-256-GCM with keys
- * derived via PBKDF2-SHA256.  The plaintext SQL data never leaves the browser
- * context: all cryptographic operations are performed using the Web Crypto API.
+ * Each `LibreSQL` instance holds a reference to a `CryptoKey` that is used
+ * automatically by {@link LibreSQL#encrypt} — no need to pass the key on
+ * every operation.  The key is non-extractable (raw bytes never accessible
+ * to JavaScript) and is kept in memory only for the lifetime of the instance.
  *
- * @example
+ * ### Key lifecycle
+ *
  * ```ts
- * // Load from a remote encrypted file
- * const db = await LibreSQL.fromURL('https://example.com/store.lsql', {
- *   password: 'my-password',
- * });
+ * // 1. Derive key once at login (store the salt server-side in the user profile)
+ * const key = await deriveKey(password, storedSalt);
+ * KeyStore.set('main', key);
  *
- * // Query
- * const [result] = db.exec('SELECT id, name FROM files');
- * console.log(result.values);
+ * // 2. Open — key is stored in the db instance automatically
+ * const db = await LibreSQL.fromURL(url, { key: KeyStore.get('main')! });
  *
- * // Always close when done to free WASM memory
+ * // 3. Write — onWrite() callback fires after every run()
+ * db.run('INSERT INTO logs VALUES (?, ?)', [Date.now(), 'action']);
+ *
+ * // 4. Persist — no key argument needed
+ * const blob = await db.encrypt();
+ * await fetch('/api/db', { method: 'PUT', body: blob });
+ *
+ * // 5. Logout
  * db.close();
+ * KeyStore.delete('main');
+ * ```
+ *
+ * ### Extending with push-on-write
+ *
+ * ```ts
+ * class CloudDB extends LibreSQL {
+ *   protected override onWrite(): void {
+ *     // fire-and-forget push after every write
+ *     void this.encrypt().then(blob =>
+ *       fetch('/api/db', { method: 'PUT', body: blob })
+ *     );
+ *   }
+ * }
  * ```
  */
 export class LibreSQL {
@@ -75,8 +105,12 @@ export class LibreSQL {
   private readonly _db: Database;
 
   /** @internal */
-  private constructor(db: Database) {
+  private _key: CryptoKey;
+
+  /** @internal */
+  protected constructor(db: Database, key: CryptoKey) {
     this._db = db;
+    this._key = key;
   }
 
   // -------------------------------------------------------------------------
@@ -126,6 +160,10 @@ export class LibreSQL {
    * Decrypts an encrypted LibreSQL blob and returns a {@link LibreSQL}
    * instance backed by the decrypted SQLite database.
    *
+   * The resolved `CryptoKey` (whether supplied directly or derived from the
+   * password in the blob header) is stored in the instance so that subsequent
+   * {@link LibreSQL#encrypt} calls require no key argument.
+   *
    * @param buffer  - Encrypted LibreSQL blob (`ArrayBuffer` or `Uint8Array`).
    * @param options - Decryption options (`password` or `key`).
    */
@@ -135,63 +173,65 @@ export class LibreSQL {
   ): Promise<LibreSQL> {
     const data =
       buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
-    const plaintext = await decryptData(data, options);
-    return LibreSQL._fromPlainBytes(plaintext);
+    const { data: plaintext, key } = await decryptData(data, options);
+    return LibreSQL._fromPlainBytes(plaintext, key);
   }
 
   // -------------------------------------------------------------------------
-  // Factory: from plaintext sources (for bootstrapping / testing)
+  // Factory: from plaintext sources (for bootstrapping / migration)
   // -------------------------------------------------------------------------
 
   /**
    * Creates a new, empty in-memory SQLite database.
    *
    * Use this to build a database programmatically before encrypting and
-   * persisting it.
+   * persisting it.  The supplied `key` is stored in the instance and used
+   * automatically by all future {@link LibreSQL#encrypt} calls.
    *
-   * @param options - Optional WASM configuration.
+   * @param options - WASM configuration and the required encryption key.
    */
-  static async create(options?: CreateOptions): Promise<LibreSQL> {
+  static async create(options: CreateOptions): Promise<LibreSQL> {
     const SQL = await getSqlJs(options);
-    return new LibreSQL(new SQL.Database());
+    return new LibreSQL(new SQL.Database(), options.key);
   }
 
   /**
    * Opens a raw (unencrypted) SQLite file as a `LibreSQL` instance.
    *
    * Useful for migrating an existing SQLite database into LibreSQL: open it
-   * here, then call {@link LibreSQL.encrypt} to produce an encrypted blob.
+   * here, then call {@link LibreSQL#encrypt} to produce an encrypted blob.
    *
    * @param buffer  - Raw SQLite bytes (`ArrayBuffer` or `Uint8Array`).
-   * @param options - Optional WASM configuration.
+   * @param options - WASM configuration and the required encryption key.
    */
   static async fromPlainBuffer(
     buffer: ArrayBuffer | Uint8Array,
-    options?: CreateOptions,
+    options: CreateOptions,
   ): Promise<LibreSQL> {
     const bytes =
       buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
-    return LibreSQL._fromPlainBytes(bytes, options);
+    return LibreSQL._fromPlainBytes(bytes, options.key, options);
   }
 
   /** @internal */
   private static async _fromPlainBytes(
     bytes: Uint8Array,
-    options?: CreateOptions,
+    key: CryptoKey,
+    options?: WasmOptions,
   ): Promise<LibreSQL> {
     const SQL = await getSqlJs(options);
-    return new LibreSQL(new SQL.Database(bytes));
+    return new LibreSQL(new SQL.Database(bytes), key);
   }
 
   // -------------------------------------------------------------------------
-  // SQL interface
+  // SQL interface — reads
   // -------------------------------------------------------------------------
 
   /**
-   * Executes one or more SQL statements and returns all result sets.
+   * Executes one or more SQL `SELECT` statements and returns all result sets.
    *
-   * For data-modification statements (`INSERT`, `UPDATE`, `DELETE`) the
-   * returned array will be empty.
+   * For data-modification statements (`INSERT`, `UPDATE`, `DELETE`) prefer
+   * {@link LibreSQL#run}, which triggers the {@link LibreSQL#onWrite} callback.
    *
    * @param sql    - SQL string (may contain `?` or named `$param` placeholders).
    * @param params - Bind parameters.
@@ -206,13 +246,20 @@ export class LibreSQL {
    * ```
    */
   exec(sql: string, params?: LibreBindParams): QueryResult[] {
-    // sql.js QueryExecResult is structurally identical to our QueryResult
     const raw: QueryExecResult[] = this._db.exec(sql, params as BindParams);
     return raw as QueryResult[];
   }
 
+  // -------------------------------------------------------------------------
+  // SQL interface — writes
+  // -------------------------------------------------------------------------
+
   /**
-   * Executes a single data-modification SQL statement.
+   * Executes a single data-modification SQL statement (`INSERT`, `UPDATE`,
+   * `DELETE`, `CREATE`, etc.) and fires the {@link LibreSQL#onWrite} callback.
+   *
+   * Override {@link LibreSQL#onWrite} in a subclass to implement push-on-write
+   * or any other write-reaction strategy.
    *
    * @param sql    - SQL string.
    * @param params - Bind parameters.
@@ -220,78 +267,125 @@ export class LibreSQL {
    */
   run(sql: string, params?: LibreBindParams): this {
     this._db.run(sql, params as BindParams);
+    void this.onWrite();
     return this;
   }
 
+  /**
+   * Called automatically after every {@link LibreSQL#run} invocation.
+   *
+   * Override this in a subclass to react to writes — for example, to
+   * re-encrypt and push the database to the server after every change:
+   *
+   * ```ts
+   * class CloudDB extends LibreSQL {
+   *   protected override onWrite(): void {
+   *     void this.encrypt().then(blob =>
+   *       fetch('/api/db', { method: 'PUT', body: blob })
+   *     );
+   *   }
+   * }
+   * ```
+   *
+   * Any `Promise` returned is **not** awaited by `run()`.  If the callback
+   * throws synchronously the error will be an unhandled rejection.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-empty-function
+  protected onWrite(): void | Promise<void> {}
+
   // -------------------------------------------------------------------------
-  // Export
+  // Key management
   // -------------------------------------------------------------------------
 
   /**
-   * Exports the current database as a raw, **unencrypted** SQLite byte array.
+   * The `CryptoKey` stored in this database instance.
    *
-   * The returned bytes can be saved locally or used as input to
-   * {@link LibreSQL.fromPlainBuffer}.  For persistent storage, prefer
-   * {@link LibreSQL.encrypt} instead to keep data protected.
+   * The key is non-extractable — raw bytes cannot be read by JavaScript.
+   * Use this to copy the key into {@link KeyStore} after password-based
+   * decryption so subsequent sessions can use the key directly:
    *
-   * @returns `Uint8Array` containing the SQLite database bytes.
+   * ```ts
+   * const db = await LibreSQL.fromURL(url, { password });
+   * KeyStore.set('main', db.key);
+   * ```
    */
-  export(): Uint8Array {
-    return this._db.export();
+  get key(): CryptoKey {
+    return this._key;
   }
 
   /**
-   * Encrypts the current database with AES-256-GCM and returns the
-   * resulting encrypted LibreSQL blob.
+   * Replaces the stored encryption key.
    *
-   * The blob can be sent to a server, stored in object storage, etc. —
-   * without exposing any SQL data, because decryption requires the key/
-   * password that only the end-user knows.
+   * The new key takes effect on the next {@link LibreSQL#encrypt} call.
+   * This does **not** re-encrypt any data immediately.
    *
-   * @param options - Must contain either `password` or `key`.
+   * @param newKey - The new AES-256-GCM `CryptoKey`.
+   */
+  rotateKey(newKey: CryptoKey): void {
+    this._key = newKey;
+  }
+
+  // -------------------------------------------------------------------------
+  // Export (encrypted only)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Vacuums, optionally compresses, and encrypts the current database using
+   * the stored {@link LibreSQL#key}.
+   *
+   * The returned blob can be sent to a server or stored in object storage
+   * without exposing any SQL data — decryption requires the key that only
+   * the end-user holds.
+   *
+   * @param options - Optional tuning. Both `vacuum` and `compress` default to
+   *   `true` to minimise the blob size.
    * @returns `Uint8Array` containing the encrypted LibreSQL blob.
    *
    * @example
    * ```ts
-   * const encrypted = await db.encrypt({ password: 'hunter2' });
-   * await fetch('/api/upload', { method: 'PUT', body: encrypted });
+   * const blob = await db.encrypt();
+   * await fetch('/api/db', { method: 'PUT', body: blob });
    * ```
    */
-  async encrypt(options: EncryptOptions): Promise<Uint8Array> {
-    const plaintext = this.export();
-    return encryptData(plaintext, options);
+  async encrypt(options?: DatabaseEncryptOptions): Promise<Uint8Array> {
+    if (options?.vacuum !== false) {
+      this._db.run('VACUUM');
+    }
+    const raw = this._db.export();
+    return encryptData(raw, {
+      key: this._key,
+      compress: options?.compress !== false,
+    });
   }
 
+  // -------------------------------------------------------------------------
+  // Version fingerprinting
+  // -------------------------------------------------------------------------
+
   /**
-   * Returns a SHA-256 digest of the **encrypted** blob produced by
-   * {@link LibreSQL.encrypt}.
+   * Returns a SHA-256 hex digest of the current database content.
    *
-   * Because the salt and IV are randomised on every call to `encrypt()`, two
-   * encryptions of the same database will produce different digests.  The
-   * intended usage is to compute the digest of the blob you *already hold*
-   * (e.g. the one fetched from the server) and compare it against a server-
-   * provided ETag or hash header **without downloading the full file again**.
-   *
-   * This is the recommended consistency check for multi-client scenarios:
+   * The digest is computed over the **unencrypted** SQLite bytes (the raw
+   * bytes never leave the instance).  Because it is deterministic, two
+   * database instances with the same data will produce the same digest —
+   * useful for detecting whether a sync is needed:
    *
    * ```ts
-   * const localDigest  = await LibreSQL.digestBlob(localEncryptedBlob);
-   * const remoteDigest = await fetch('/api/db.lsql.sha256').then(r => r.text());
+   * const localDigest  = await db.digest();
+   * const remoteDigest = await fetch('/api/db.sha256').then(r => r.text());
    *
    * if (localDigest !== remoteDigest) {
-   *   // Remote copy is newer — download, decrypt, merge / replace
+   *   // Remote has newer data — fetch and reload
    * }
    * ```
    *
-   * @param blob - An encrypted LibreSQL blob (`Uint8Array` or `ArrayBuffer`).
-   * @returns Lowercase hex-encoded SHA-256 digest string.
+   * @returns Lowercase hex-encoded SHA-256 string (64 characters).
    */
-  static async digestBlob(blob: Uint8Array | ArrayBuffer): Promise<string> {
-    const raw = blob instanceof Uint8Array ? blob : new Uint8Array(blob);
-    // Ensure it's backed by a plain ArrayBuffer (TypeScript 6+ Web Crypto requirement)
-    const data: Uint8Array<ArrayBuffer> = raw.buffer instanceof ArrayBuffer
-      ? raw as Uint8Array<ArrayBuffer>
-      : (() => { const c = new Uint8Array(raw.byteLength); c.set(raw); return c; })();
+  async digest(): Promise<string> {
+    const raw = this._db.export();
+    // Ensure plain ArrayBuffer backing for Web Crypto
+    const data = new Uint8Array(raw.byteLength);
+    data.set(raw);
     const hashBuffer = await crypto.subtle.digest('SHA-256', data);
     return Array.from(new Uint8Array(hashBuffer))
       .map((b) => b.toString(16).padStart(2, '0'))
