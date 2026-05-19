@@ -1,0 +1,57 @@
+{
+  "name": "libresql",
+  "version": "1.0.0",
+  "description": "Browser-based E2EE SQLite database for end-to-end encrypted SaaS applications",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc --emitDeclarationOnly && vite build",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "sqlite",
+    "e2ee",
+    "encryption",
+    "browser",
+    "aes-gcm",
+    "sql",
+    "wasm",
+    "end-to-end-encryption"
+  ],
+  "author": "Johannes Maron",
+  "license": "BSD-2-Clause",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/codingjoe/libreSQL.git"
+  },
+  "bugs": {
+    "url": "https://github.com/codingjoe/libreSQL/issues"
+  },
+  "homepage": "https://github.com/codingjoe/libreSQL#readme",
+  "peerDependencies": {
+    "sql.js": "^1.14.1"
+  },
+  "devDependencies": {
+    "@types/sql.js": "^1.4.11",
+    "@vitest/coverage-v8": "^4.1.6",
+    "sql.js": "^1.14.1",
+    "typescript": "^6.0.3",
+    "vite": "^6.4.2",
+    "vitest": "^4.1.6"
+  }
+}
