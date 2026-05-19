@@ -262,6 +262,42 @@ export class LibreSQL {
     return encryptData(plaintext, options);
   }
 
+  /**
+   * Returns a SHA-256 digest of the **encrypted** blob produced by
+   * {@link LibreSQL.encrypt}.
+   *
+   * Because the salt and IV are randomised on every call to `encrypt()`, two
+   * encryptions of the same database will produce different digests.  The
+   * intended usage is to compute the digest of the blob you *already hold*
+   * (e.g. the one fetched from the server) and compare it against a server-
+   * provided ETag or hash header **without downloading the full file again**.
+   *
+   * This is the recommended consistency check for multi-client scenarios:
+   *
+   * ```ts
+   * const localDigest  = await LibreSQL.digestBlob(localEncryptedBlob);
+   * const remoteDigest = await fetch('/api/db.lsql.sha256').then(r => r.text());
+   *
+   * if (localDigest !== remoteDigest) {
+   *   // Remote copy is newer — download, decrypt, merge / replace
+   * }
+   * ```
+   *
+   * @param blob - An encrypted LibreSQL blob (`Uint8Array` or `ArrayBuffer`).
+   * @returns Lowercase hex-encoded SHA-256 digest string.
+   */
+  static async digestBlob(blob: Uint8Array | ArrayBuffer): Promise<string> {
+    const raw = blob instanceof Uint8Array ? blob : new Uint8Array(blob);
+    // Ensure it's backed by a plain ArrayBuffer (TypeScript 6+ Web Crypto requirement)
+    const data: Uint8Array<ArrayBuffer> = raw.buffer instanceof ArrayBuffer
+      ? raw as Uint8Array<ArrayBuffer>
+      : (() => { const c = new Uint8Array(raw.byteLength); c.set(raw); return c; })();
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(hashBuffer))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+
   // -------------------------------------------------------------------------
   // Lifecycle
   // -------------------------------------------------------------------------

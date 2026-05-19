@@ -43,13 +43,13 @@
     "url": "https://github.com/codingjoe/libreSQL/issues"
   },
   "homepage": "https://github.com/codingjoe/libreSQL#readme",
-  "peerDependencies": {
+  "peerDependencies": {},
+  "dependencies": {
     "sql.js": "^1.14.1"
   },
   "devDependencies": {
     "@types/sql.js": "^1.4.11",
     "@vitest/coverage-v8": "^4.1.6",
-    "sql.js": "^1.14.1",
     "typescript": "^6.0.3",
     "vite": "^6.4.2",
     "vitest": "^4.1.6"

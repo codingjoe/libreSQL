@@ -196,6 +196,50 @@ describe('LibreSQL.fromPlainBuffer', () => {
 });
 
 // ---------------------------------------------------------------------------
+// LibreSQL.digestBlob
+// ---------------------------------------------------------------------------
+
+describe('LibreSQL.digestBlob', () => {
+  it('returns a 64-char lowercase hex string (SHA-256)', async () => {
+    const db = await seedDatabase();
+    const key = await generateKey();
+    const encrypted = await db.encrypt({ key });
+    db.close();
+
+    const digest = await LibreSQL.digestBlob(encrypted);
+    expect(digest).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('same blob produces the same digest', async () => {
+    const db = await seedDatabase();
+    const key = await generateKey();
+    const encrypted = await db.encrypt({ key });
+    db.close();
+
+    const d1 = await LibreSQL.digestBlob(encrypted);
+    const d2 = await LibreSQL.digestBlob(encrypted);
+    expect(d1).toBe(d2);
+  });
+
+  it('different blobs produce different digests', async () => {
+    const db = await seedDatabase();
+    const key = await generateKey();
+    // Two separate encryptions use different random IV+salt → different ciphertext
+    const enc1 = await db.encrypt({ key });
+    const enc2 = await db.encrypt({ key });
+    db.close();
+
+    expect(await LibreSQL.digestBlob(enc1)).not.toBe(await LibreSQL.digestBlob(enc2));
+  });
+
+  it('accepts ArrayBuffer as input', async () => {
+    const data = new Uint8Array([1, 2, 3, 4]).buffer;
+    const digest = await LibreSQL.digestBlob(data);
+    expect(digest).toHaveLength(64);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Full end-to-end: create → encrypt → fromBuffer → query
 // ---------------------------------------------------------------------------
 

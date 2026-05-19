@@ -25,6 +25,9 @@ export { LibreSQL } from './database.js';
 // Crypto primitives (for advanced use-cases)
 export { decryptData, deriveKey, encryptData, generateKey, importRawKey } from './crypto.js';
 
+// Secure session key storage
+export { KeyStore } from './keystore.js';
+
 // Types
 export type {
   BindParams,
